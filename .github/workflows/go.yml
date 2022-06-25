@@ -1,79 +1,140 @@
-name: build
-
+name: Build ZipExec Release
 on:
     release:
         types: [created]
 
 jobs:
-  build-rotateproxy:
-    runs-on: ubuntu-18.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v1
-        with:
-          version: 0.9.1
-      - name: Setup Golang
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.17
-      - name: Build ZipExec
-        run: |
-          # download macos sysroot
-          git clone --depth=1 https://github.com/hexops/sdk-macos-12.0.git "$HOME/macos-SDK"
-          # create zig script
-          mkdir -p "$HOME/.bin"
-          export PATH=$PATH:"$HOME/.bin"
-          touch "$HOME/.bin/zcc" && touch "$HOME/.bin/zxx"
-          chmod +x "$HOME/.bin/zcc" && chmod +x "$HOME/.bin/zxx"
-          mkdir -p build
-          #cd cmd/rotateproxy
-          configs=(
-            'linux amd64 x86_64-linux-musl'
-            'linux 386 i386-linux-musl'
-            'windows amd64 x86_64-windows-gnu'
-            'windows 386 i386-windows-gnu'
-            'darwin amd64 x86_64-macos-gnu'
-          )
-          IFS=$'\n'
-          for i in ${configs[@]}
-          do
-            IFS=$' '
-            config=($i)
-            goos=${config[0]}
-            goarch=${config[1]}
-            libc=${config[2]}
-            ext=''
-            if [ "${goos}" = "windows" ];then
-              ext='.exe'
-            fi
-            # ref: https://dev.to/kristoff/zig-makes-go-cross-compilation-just-work-29ho
-            echo "goos: ${goos}  goarch: ${goarch}  libc: ${libc}"
-            echo '#!/bin/sh' > "$HOME/.bin/zcc"
-            echo '#!/bin/sh' > "$HOME/.bin/zxx"
-            # ref: https://github.com/ziglang/zig/issues/10660
-            # ref: https://github.com/ziglang/zig/issues/1349
-            # ref: https://github.com/ziglang/zig/issues/10299#issuecomment-989153750
-            if [ "${goos}" = "darwin" ];then
-              # zig 0.10.0关于sysroot的行为有变更，参见 https://github.com/ziglang/zig/issues/10790#issuecomment-1030712395
-              echo 'ZIG_LOCAL_CACHE_DIR="$HOME/tmp" zig cc -target '${libc}' --sysroot="$HOME/macos-SDK/root" -I"$HOME/macos-SDK/root/usr/include" -L"$HOME/macos-SDK/root/usr/lib" -F"$HOME/macos-SDK/root/System/Library/Frameworks" $@' >> "$HOME/.bin/zcc"
-              echo 'ZIG_LOCAL_CACHE_DIR="$HOME/tmp" zig c++ -target '${libc}' --sysroot="$HOME/macos-SDK/root" -I"$HOME/macos-SDK/root/usr/include" -L"$HOME/macos-SDK/root/usr/lib" -F"$HOME/macos-SDK/root/System/Library/Frameworks" $@' >> "$HOME/.bin/zxx"
-              # zig cc 调用clang，clang更新后默认加了一些参数，见 https://github.com/golang/go/issues/38876 https://stackoverflow.com/questions/42074035
-              # 经过测试最基本需要 -Wno-nullability-completeness -Wno-expansion-to-defined -Wno-availability
-              export CGO_CPPFLAGS="-Wno-error -Wno-nullability-completeness -Wno-expansion-to-defined -Wno-builtin-requires-header -Wno-availability"
-            else
-              echo 'ZIG_LOCAL_CACHE_DIR="$HOME/tmp" zig cc -target '${libc}' $@' >> "$HOME/.bin/zcc"
-              echo 'ZIG_LOCAL_CACHE_DIR="$HOME/tmp" zig c++ -target '${libc}' $@' >> "$HOME/.bin/zxx"
-            fi
-            cat "$HOME/.bin/zxx"
-            cat "$HOME/.bin/zcc"
-            CGO_ENABLED=1 GOOS="${goos}" GOARCH="${goarch}" CC="zcc" CXX="zxx" go build -o "build/ZipExec-${goos}-${goarch}${ext}" -trimpath -ldflags="-linkmode=external -extldflags=-static -s -w"
-          done
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v2
-        with:
-          version: latest
-          args: release --rm-dist
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    build:
+        name: Build Binary
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                #os: [windows-latest, ubuntu-latest, macos-latest]
+                os: [ubuntu-latest, macos-latest]
+                arch: ['386', amd64]
+                # We sometimes use different verbiage for things (e.g. "darwin"
+                # for the GOOS build flag and "osx" in the actual release ZIP).
+                # We need to specify those here.
+                include:
+                    #- os: windows-latest
+                    #  goos: windows
+                    #  bin: 'gophish.exe'
+                    #  releaseos: windows
+                    - os: ubuntu-latest
+                      goos: linux
+                      bin: 'ZipExec'
+                      releaseos: linux
+                    - os: macos-latest
+                      goos: darwin
+                      bin: 'ZipExec'
+                      releaseos: osx
+                # Don't build windows-32bit due to missing MinGW dependencies
+                # Don't build osx-32bit due to eventual drop in Go support
+                exclude:
+                    #- os: windows-latest
+                    #  arch: '386'
+                    - os: macos-latest
+                      arch: '386'
+        steps:
+            - name: Set up Go
+              uses: actions/setup-go@v2
+              with:
+                go-version: 1.14
+            - if: matrix.os == 'ubuntu-latest'
+              run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+            - if: matrix.arch == '386'
+              run: echo "name=ZipExec-${{ github.event.release.tag_name }}-${{ matrix.releaseos}}-32bit" >> $GITHUB_ENV
+            - if: matrix.arch == 'amd64'
+              run: echo "name=ZipExec-${{ github.event.release.tag_name}}-${{ matrix.releaseos}}-64bit" >> $GITHUB_ENV
+            - uses: actions/checkout@v2
+            - name: Build ${{ matrix.goos }}/${{ matrix.arch }}
+              run: go build -o ${{ matrix.bin }}
+              env:
+                GOOS: ${{ matrix.goos }}
+                GOARCH: ${{ matrix.arch }}
+                CGO_ENABLED: 1
+            - name: Upload to artifacts
+              uses: actions/upload-artifact@v2
+              with:
+                name: ${{ env.name }}
+                path: ${{ matrix.bin }}
+
+    package:
+        name: Package Assets
+        runs-on: ubuntu-latest
+        needs: build
+        steps:
+            - uses: actions/checkout@v2
+            - uses: actions/download-artifact@v2
+              with:
+                path: bin
+            - name: Package Releases
+              run: |
+                mkdir releases;
+                for RELEASE_DIR in bin/*
+                do
+                  echo "Creating release $RELEASE_DIR"
+                  for BINARY in $RELEASE_DIR/*
+                  do
+                    cp $BINARY .;
+                    zip -r releases/$(basename $RELEASE_DIR).zip \
+                      $(basename ${BINARY});
+                    rm $BINARY;
+                  done
+                done
+            - name: Upload to artifacts
+              uses: actions/upload-artifact@v2
+              with:
+                name: releases
+                path: releases/*.zip
+    
+    upload:
+        name: Upload to the Release
+        runs-on: ubuntu-latest
+        needs: package
+        steps:
+            - uses: actions/download-artifact@v2
+              with:
+                name: releases
+                path: releases/
+            # I would love to use @actions/upload-release-asset, but they don't
+            # support wildcards in the asset path. Ref #9, #24, and #47
+            - name: Upload Archives to Release
+              env:
+                UPLOAD_URL: ${{ github.event.release.upload_url }}
+                API_HEADER: "Accept: application/vnd.github.v3+json"
+                AUTH_HEADER: "Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+              run: |
+                UPLOAD_URL=$(echo -n $UPLOAD_URL | sed s/\{.*//g)
+                for FILE in releases/*
+                do
+                  echo "Uploading ${FILE}";
+                  curl \
+                    -H "${API_HEADER}" \
+                    -H "${AUTH_HEADER}" \
+                    -H "Content-Type: $(file -b --mime-type ${FILE})" \
+                    --data-binary "@${FILE}" \
+                    "${UPLOAD_URL}?name=$(basename ${FILE})";
+                done
+            - name: Generate SHA256 Hashes
+              env:
+                API_HEADER: "Accept: application/vnd.github.v3+json"
+                AUTH_HEADER: "Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+                RELEASE_URL: ${{ github.event.release.url }}
+              run: |
+                HASH_TABLE="| SHA256 Hash | Filename |"
+                HASH_TABLE="${HASH_TABLE}\n|-----|-----|\n"
+                for FILE in releases/*
+                do
+                  FILENAME=$(basename ${FILE})
+                  HASH=$(sha256sum ${FILE} | cut -d ' ' -f 1)
+                  HASH_TABLE="${HASH_TABLE}|${HASH}|${FILENAME}|\n"
+                done
+                echo "${HASH_TABLE}"
+                curl \
+                  -XPATCH \
+                  -H "${API_HEADER}" \
+                  -H "${AUTH_HEADER}" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"body\": \"${HASH_TABLE}\"}" \
+                  "${RELEASE_URL}";
